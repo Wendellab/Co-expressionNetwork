@@ -1,4 +1,4 @@
-brary(WGCNA);
+library(WGCNA);
 library(RColorBrewer);
 library(ggplot2);
 options(stringsAsFactors = FALSE)
