@@ -1,0 +1,420 @@
+############## Install WGCNA ####################
+install.packages("WGCNA")
+install.packages(c("dynamicTreeCut", "cluster", "flashClust", "Hmisc", "reshape", "foreach", "doParallel") ) 
+source("http://bioconductor.org/biocLite.R") 
+biocLite("impute") 
+orgCodes = c("Hs", "Mm", "Rn", "Pf", "Sc", "Dm", "Bt", "Ce", "Cf", "Dr", "Gg"); 
+orgExtensions = c(rep(".eg", 4), ".sgd", rep(".eg", 6)); 
+packageNames = paste("org.", orgCodes, orgExtensions, ".db", sep=""); 
+biocLite(c("GO.db", "KEGG.db", "topGO", packageNames, "hgu133a.db", "hgu95av2.db", "annotate", "hgu133plus2.db", "SNPlocs.Hsapiens.dbSNP.20100427", "minet", "OrderedList"))
+
+
+
+workingDir="~/Dropbox/CoexpressionNetworkAnalysis/oilseedRPKM"
+setwd(workingDir);
+# Load the package
+library(WGCNA);
+library(RColorBrewer)
+# The following setting is important, do not omit.
+options(stringsAsFactors = FALSE);
+enableWGCNAThreads();
+
+############### Step 1. Basic data processing and cleaning  ############### 
+
+# load expression data
+data = read.table("All ADT RPKM.txt",header=TRUE, sep="\t");
+# Take a quick look at what is in the data set:
+dim(data);  #37223   157
+names(data);
+names(data)<-gsub("assemblies.|.bam","",names(data))
+#  Make each row corresponds to a gene and column to a sample or auxiliary information.
+datExpr0 = as.data.frame(t(data[, -1]));
+names(datExpr0) = data[,1];
+rownames(datExpr0);
+
+# Check for genes and samples with too many missing values
+gsg = goodSamplesGenes(datExpr0, verbose = 3); 
+#Excluding 5889 genes  from the calculation due to too many missing samples or zero variance.
+gsg$allOK
+# If the last statement returns TRUE, all genes have passed the cuts. If not, we remove the offending genes and samples from the data:
+if (!gsg$allOK)
+{
+   # Optionally, print the gene and sample names that were removed:
+   if (sum(!gsg$goodGenes)>0)
+   printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")));
+   if (sum(!gsg$goodSamples)>0)
+   printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")));
+   # Remove the offending genes and samples from the data:
+   datExpr = datExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+dim(datExpr0)  # raw  156 37223
+dim(datExpr)   # now  156 31334
+
+# Cluster the samples (in contrast to clustering genes that will come later) to see if there are any obvious outliers. We use the function flashClust that provides faster hierarchical clustering than the standard function hclust.
+sampleTree = flashClust(dist(datExpr), method = "average");
+# Plot the sample tree: Open a graphic output window of size 12 by 9 inches
+# The user should change the dimensions if the window is too large or too small.
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+cex.axis = 1.5, cex.main = 2)
+
+# read in sample condition and match the samples.
+traitData = read.csv("SampleCondition.csv");
+dim(traitData)
+names(traitData)
+# Form a data frame analogous to condition table.
+dataSamples = rownames(datExpr);
+traitRows = match(dataSamples, traitData$sample);
+datTraits = traitData[traitRows, -1];
+rownames(datTraits) = traitData[traitRows, 1];
+collectGarbage();
+# visualize how the clinical traits relate to the sample dendrogram.
+# Re-cluster samples
+sampleTree2 = flashClust(dist(datExpr), method = "average")
+# Convert traits to a color representation
+traitColors = data.frame(
+     genome=brewer.pal(nlevels(factor(datTraits$genome) ),"Set1") [as.numeric(factor(datTraits$genome) )],
+     dpa   =brewer.pal(nlevels(factor(datTraits$dpa   ) ),"Set2") [as.numeric(factor(datTraits$dpa   ) )],
+     rep   = "grey",
+     sub   =brewer.pal(nlevels(factor(datTraits$sub   ) ),"Set3") [as.numeric(factor(datTraits$sub   ) )] )          
+# Plot the sample dendrogram and the colors underneath.
+sizeGrWindow(12,9)
+pdf(file = "sampleClustering.pdf", width = 12, height = 9);
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+plotDendroAndColors(sampleTree2, traitColors, groupLabels = names(datTraits), main = "Sample dendrogram and trait heatmap",cex.dendroLabels = 0.5, cex.colorLabels=1.5, colorHeight =0.1)
+dev.off()
+save(datExpr, datTraits, file = "oilseed-01-dataInput.RData")
+
+############### Step 2.  Choosing the soft-thresholding power: analysis of network topology  ############### 
+
+# if start a new R seesion
+"
+workingDir=''
+setwd(workingDir);
+library(WGCNA);
+library(RColorBrewer);
+library(ggplot2);
+options(stringsAsFactors = FALSE);
+enableWGCNAThreads()
+lnames = load(file = "oilseed-01-dataInput.RData");
+lnames
+"
+# the current expression contains still too many genes to build network, I need to filter them more
+# AND Genes with across-the-board low expressions tend to reflect noise and correlations based on counts that are mostly zero aren't really meaningful. These genes should be removed; for example, genes with read count < 10 in more than 90% of the samples. The actual thresholds should be based on experimental design, sequencing depth and sample counts.
+
+table(apply(datExpr,2,mean)>=2)      # average RPKM >=2 17829 
+table(apply(datExpr,2,median)>=2)    # median RPKM >=2  16673   ** makes sense to me, save as datExpr1
+table(apply(datExpr,2,max)>=2)       # max RPKM >=2     28732
+table(apply(datExpr,2,max)>10)       # max RPKM >=10    16752   ** makes sense to me, save as datExpr2
+table(apply(datExpr,2,min)>=2)       # min RPKM >=2      5467
+
+# Or remove genes with centain percentage of RPKM counts lower than a cutoff
+table(apply(datExpr,2,filter<-function(x){length(x[x<=10] )/length(x)==1} ) )   # same as max RPKM>=10, 16752 should be kept, same as 
+table(apply(datExpr,2,filter<-function(x){length(x[x<=5] )/length(x)>0.95} ) )  # 13422 genes with over 95% counts <=5, 17912 should be kept 
+
+dim( datExpr1 <- datExpr[,apply(datExpr,2,median)>=2] )   #16673
+dim( datExpr2 <- datExpr[,apply(datExpr,2,max)>10] )      #16752
+dim( datExpr3 <- datExpr[,apply(datExpr,2,filter<-function(x){length(x[x<=5] )/length(x)>0.95} ) ==FALSE] )    #17912
+
+save(datExpr1, datExpr2, datExpr3, datTraits, file = "oilseed-02-dataFilter.RData")
+
+
+#### Repeat below for datExpr1, datExpr2, datExpr3, between repeats, rename sft folder
+# work with individual genome
+for (i in c("A2","D5","AD3","TM1","Yuc") )
+{
+    # i="A2"
+	# Extract total read counts for each genome
+	subTraits <- datTraits[datTraits$genome == i & datTraits$sub=="T",]
+	subDat    <-   datExpr1[datTraits$genome == i & datTraits$sub=="T",]
+	
+	# Choose a set of soft-thresholding powers
+	powers = c(c(1:10), seq(from = 12, to=40, by=2))
+	# Call the network topology analysis function
+	system.time( sft <- pickSoftThreshold(subDat, powerVector = powers, verbose = 5) )
+	# Plot the results:
+	pdf(file = paste("sft/SoftThreshold_",i,".pdf",sep=""), height=5,width=9)
+	sizeGrWindow(9, 5)
+	par(mfrow = c(1,2));
+	cex1 = 0.9;
+	# Scale-free topology fit index as a function of the soft-thresholding power
+	plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n", main = paste("Scale independence"));
+	text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+	labels=powers,cex=cex1,col="red");
+	# this line corresponds to using an R^2 cut-off of h
+	abline(h=0.80, col="orange")      # converge to 0.8 with 12 samples
+	abline(h=0.90, col="red")         # converge to 0.9 with 24 samples
+	# Mean connectivity as a function of the soft-thresholding power	
+	plot(sft$fitIndices[,1], sft$fitIndices[,5], xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+	main = paste("Mean connectivity"))
+	text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+	dev.off()
+	write.table(as.data.frame(sft$fitIndices), file= paste("sft/SoftThreshold_",i,".txt",sep=""), sep="\t")
+}
+
+
+# Inspect all the threshold tables, if the model fit converge to 0.8, manually inspect SFT.R.sq >=0.8 
+setwd("./sft/")
+file_list<-list.files(pattern=".*txt")
+rm(dataset)
+for (file in file_list){       
+   # if the merged dataset doesn't exist, create it
+   if (!exists("dataset")){
+     dataset <- read.table(file, header=TRUE, sep="\t")
+   }  
+   # if the merged dataset does exist, append to it
+   else{
+     temp_dataset <-read.table(file, header=TRUE, sep="\t")
+     dataset<-rbind(dataset, temp_dataset)
+     rm(temp_dataset)
+   }  
+}
+sfts<-dataset
+sfts$genome<-rep(gsub(".*_|.txt","",file_list), each=25)
+# plot all the curves together
+pdf("allgenome.pdf")
+ggplot(sfts, aes(x=Power, y=SFT.R.sq, color=genome)) + geom_point() +geom_line()+geom_hline(yintercept=0.8)	
+ggplot(sfts, aes(x=Power, y=mean.k., color=genome)) + geom_point() +geom_line()
+dev.off()
+###### End of repeat
+
+# Inspect "allgenome.pdf", a bit hard to choose Power. I am going to test c(20, 25, 30) to see how the choice affect my network and results.
+## The fit can be affected by the choice of filtering methods. 
+## datExpr2 and datExpr3 behave almost the same, better than datExpr1, so I flip a coin and chose datExpr3
+
+############### Step 3.  Network Construction  ############### 
+
+# if start a new R seesion
+"
+workingDir=''
+setwd(workingDir);
+library(WGCNA);
+library(RColorBrewer);
+library(ggplot2);
+options(stringsAsFactors = FALSE);
+enableWGCNAThreads()
+lnames = load(file = "oilseed-02-dataFilter.RData");
+lnames
+"
+
+# work with individual genome, then work with different soft threshold
+#for (i in c("A2","D5","AD3","TM1","Yuc") )
+#for j in c(20, 25, 30, 40) )
+
+##### START of manual construction, but gene sets over 5000 are very likely to kill R!!!!!
+# Extract total read counts for each genome
+i="A2"
+subTraits <- datTraits[datTraits$genome == i & datTraits$sub=="T",]
+subDat    <-   datExpr3[datTraits$genome == i & datTraits$sub=="T",]
+
+# test different softpower	
+j= 20 
+softPower = j
+
+# computes the network connectivity (Connectivity)
+Connectivity= softConnectivity(subDat,power=softPower)
+# Creating Scale Free Topology Plots (SUPPLEMENTARY FIGURE S1 in our article)
+par(mfrow=c(1,1))
+scaleFreePlot(Connectivity, truncated=T,main= paste("beta=",as.character(softPower)))
+
+	     
+# We now calculate the adjacencies, using the soft thresholding power 
+adjacency = adjacency(subDat, power = softPower);
+# Turn adjacency into topological overlap
+TOM = TOMsimilarity(adjacency);
+dissTOM = 1-TOM
+
+# Call the hierarchical clustering function using TOM
+geneTree = flashClust(as.dist(dissTOM), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+              labels = FALSE, hang = 0.04);
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 30;
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+deepSplit = 2, pamRespectsDendro = FALSE,
+minClusterSize = minModuleSize);
+table(dynamicMods)	
+# Returned 22 modules from largest to smallest. Label 0 is reserved for unassigned genes.
+
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram and module colors")
+
+# Merging of modules whose expression profiles are very similar
+# Calculate eigengenes
+MEList = moduleEigengenes(subDat, colors = dynamicColors)   # MEList = moduleEigengenes(subDat[,bwnet$goodGenes], colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = flashClust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes",xlab = "", sub = "")	
+
+# A height cut of 0.25, corresponding to correlation of 0.75, to merge these modules:
+MEDissThres = 0.25
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(subDat, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+	 = merge$newMEs;
+sizeGrWindow(12, 9)
+#pdf(file = "Plots/geneDendro-3.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), c("Dynamic Tree Cut", "Merged dynamic"),dendroLabels = FALSE, hang = 0.03,addGuide = TRUE, guideHang = 0.05)
+#dev.off()
+
+In the subsequent analysis, we will use the merged module colors in mergedColors. We save the relevant variables for
+use in subsequent parts of the tutorial:
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs;
+# Save module colors and labels for use in subsequent parts
+save(MEs, moduleLabels, moduleColors, geneTree, file = ".....RData")
+
+##### END of manual construction, celebrate if getting here without crashing R
+##### Otherwise, time to do block-wise construction or run R in bash mode in server or somewhere powerful
+
+#R --save < script.R >A2_out.txt
+nohup R CMD BATCH buildnetwork.R &           
+#output as buildnetwork.Rout
+
+############### Step 4.  Module-level analysis  ############### 
+# if start a new R seesion
+"
+workingDir=''
+setwd(workingDir);
+library(WGCNA);
+library(RColorBrewer);
+library(scatterplot3d);
+library(ggplot2);
+options(stringsAsFactors = FALSE);
+enableWGCNAThreads()
+"
+i="A2"
+subTraits <- datTraits[datTraits$genome == i & datTraits$sub=="T",]
+subDat    <-   datExpr3[datTraits$genome == i & datTraits$sub=="T",]
+load("A2_power20.RData")
+Anet20<-net
+load("A2_power25.RData")
+Anet25<-net
+load("A2_power30.RData")
+Anet30<-net
+gg<-Anet20$goodGenes #get the good genes
+pdf("A2_modules_cluster.pdf")
+plotDendroAndColors(Anet20$dendrograms[[1]], cbind(labels2colors(Anet20$colors[gg]),labels2colors(Anet25$colors[gg]),labels2colors(Anet30$colors[gg])),c("power=20","power=25","power=30"),dendroLabels = FALSE, hang = 0.03,addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+# Network topology and other concepts need to be explored more!!!!!!!!!!!!!!!!!!
+# The following computes the network connectivity (Connectivity)
+par(mfrow=c(2,2))
+pdf("A2_network_connectivity.pdf")
+for(j in c(20,25,30)){
+k= softConnectivity(subDat,power=j)
+# Creating Scale Free Topology Plots (SUPPLEMENTARY FIGURE S1 in our article)
+scaleFreePlot(k, truncated=T,main= paste("beta=",j))
+}
+dev.off()
+
+discretized.k = cut(k, 20)
+dk = tapply(k, discretized.k, mean)
+p.dk = as.vector(tapply(k, discretized.k, length)/length(k))
+plot(log(dk, 10), log(p.dk, 10))              # power law, # linear
+
+
+
+#### Eigengenes are the 1st principal component of modules in a given single dataset, which provide a summary profile for each module.
+# Study the relationships among the found modules. 
+load('~/Downloads/A2_power20_TOM-block.1.RData')
+dissTOM=as.matrix(1-TOM)
+# test this with a subset of the TOM, otherwise it will take forever
+select<-sample(dim(dissTOM)[1],500)
+selectTOM = dissTOM[select, select];
+selectTree = flashClust(as.dist(selectTOM), method = "average")
+selectColors = labels2colors(Anet20$colors[Anet20$goodGenes])[select];
+sizeGrWindow(9,9)
+# Taking the dissimilarity to a power, say 10, makes the plot more informative by effectively changing
+# the color palette; setting the diagonal to NA also improves the clarity of the plot
+plotDiss = selectTOM^7;
+diag(plotDiss) = NA;
+TOMplot(plotDiss, selectTree, selectColors, main = "Network heatmap plot, selected genes")
+
+# use classical multi-dimensional scaling plots 
+# for visualizing the network. Here we chose 3 scaling dimensions
+# This also takes about 10 minutes...
+cmd1=cmdscale(as.dist(selectTOM),4)
+par(mfrow=c(2,3))
+plot(cmd1[,c(1,2)], col= as.character(selectColors) )
+plot(cmd1[,c(1,3)], col= as.character(selectColors) )
+plot(cmd1[,c(1,4)], col= as.character(selectColors) )
+plot(cmd1[,c(2,3)], col= as.character(selectColors) )
+plot(cmd1[,c(2,4)], col= as.character(selectColors) )
+plot(cmd1[,c(3,4)], col= as.character(selectColors) )
+# 3D plot, oh yeah
+par(mfrow=c(1,1))
+scatterplot3d(cmd1[,1:3], color=as.character(colorh1),  main="MDS plot",xlab="Scaling Dimension 1", ylab="Scaling Dimension 2", zlab="Scaling Dimension 3",cex.axis=1.5,angle=320)
+
+#### Displaying module heatmap and the eigengene
+sizeGrWindow(8,7);
+pdf("A2_network20_module&expression.pdf")
+for(i in 0:dim(Anet20$MEs)[2]) {
+       which.module=paste("ME",i,sep="")
+       module.color=labels2colors(i)
+       #heatmap
+       par(mfrow=c(2,1), mar=c(0.3, 5.5, 4, 2))
+       plotMat(t(scale(subDat[,Anet20$colors==i ]) ),
+               nrgcols=30,rlabels=T,rcols=module.color,
+               main=which.module, cex.main=2)
+       #barplot
+       par(mar=c(5, 4.2, 0, 0.7))
+       barplot(Anet20$MEs[,which.module], col=module.color, main="", cex.main=2,
+       ylab="eigengene expression",xlab="seed development (dpa)", names.arg=rep(c(10,20,30,40), each=3) )
+}
+dev.off()
+
+#### Relate to eigengenes to external traits or sample conditions
+# Define numbers of genes and samples
+nGenes = ncol(subDat);
+nSamples = nrow(subDat);
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(subDat, labels2colors(Anet20$colors))$eigengenes
+MEs = orderMEs(MEs0)
+# calculate corelation between eigengenes and condition -dpa
+moduleTraitCor = cor(MEs, subTraits$dpa, use = "p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+# graphical representation for corelation 
+
+sizeGrWindow(5,6)
+# Will display correlations and their p-values
+pdf("A2_network20_modules.pdf")
+textMatrix = paste(signif(moduleTraitCor, 2), " (", signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor, xLabels = "dpa", yLabels = names(MEs),
+               ySymbols = names(MEs), colorLabels = TRUE, colors = blueWhiteRed(50), 
+               textMatrix = as.matrix(textMatrix), setStdMargins = FALSE,
+               cex.text = 0.7,zlim = c(-1,1), main = paste("Module-development relationships"))
+# Another way to visualize the correlations with eigegene dendrogram and adjacency heatmap, BUT the heatmap color bar is NOT RIGHT, should be (-1, 1)
+MET = orderMEs(cbind(MEs, subTraits$dpa))
+sizeGrWindow(5,7.5);
+par(cex = 0.9)
+plotEigengeneNetworks(MET, "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2), cex.lab = 0.8, xLabelsAngle= 90)
+dev.off()
