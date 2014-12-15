@@ -189,7 +189,7 @@ plot(consMETree, main = "Consensus clustering of consensus module eigengenes bef
 abline(h=0.25, col = "red")
 plot(consMETree.merged, main = "Consensus clustering of consensus module eigengenes after merging",xlab = "", sub = "")
 plotDendroAndColors(consTree, cbind(unmergedColors, moduleColors), c("Unmerged", "Merged"), dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05)
-plotDendroAndColors(consTree, cbind(moduleColors, labels2colors(all.colors) ), c("Consensus",shortLabels[comp]), dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05, main = "Consensus gene dendrogram and module colors")
+plotDendroAndColors(consTree, cbind(moduleColors, labels2colors(all.colors[,comp]) ), c("Consensus",shortLabels[comp]), dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05, main = "Consensus gene dendrogram and module colors")
 # Eigengenes are the 1st principal component of modules in a given single dataset, which provide a summary profile for each module.
 # Displaying module heatmap and the eigengene
 # sizeGrWindow(8,7);
